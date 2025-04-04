@@ -6,6 +6,8 @@ import argparse
 import getpass
 import base64
 import time
+import re
+import webbrowser
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -35,7 +37,7 @@ class SSMPortForwarder:
                     with open(self.key_file, 'rb') as f:
                         salt = f.read()
                     password = getpass.getpass("Enter password to decrypt connections: ")
-                except Exception as e:
+                except IOError as e:
                     print(f"Error reading key file: {e}")
                     salt = os.urandom(16)
                     password = getpass.getpass("Create a password to encrypt connections: ")
@@ -55,9 +57,9 @@ class SSMPortForwarder:
                 with open(self.key_file, 'wb') as f:
                     f.write(salt)
                 
-        # Asegurarse de que la contraseña no esté vacía
+        # Ensure password is not empty
         if not password or password.strip() == "":
-            raise ValueError("La contraseña no puede estar vacía")
+            raise ValueError("Password cannot be empty")
                 
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
@@ -89,14 +91,20 @@ class SSMPortForwarder:
                 self.connections = json.loads(decrypted_data.decode())
                 print(f"Loaded {len(self.connections)} saved connections")
                 return
-            except (InvalidToken, ValueError) as e:
+            except InvalidToken:
                 attempts += 1
                 if attempts < max_attempts:
-                    print(f"Error: Contraseña incorrecta. Intento {attempts} de {max_attempts}")
+                    print(f"Error: Incorrect password. Attempt {attempts} of {max_attempts}")
                 else:
-                    print("Error: Demasiados intentos fallidos. No se pudieron cargar las conexiones.")
-            except Exception as e:
-                print(f"Error loading connections: {e}")
+                    print("Error: Too many failed attempts. Could not load connections.")
+            except ValueError as e:
+                print(f"Error: {str(e)}")
+                break
+            except json.JSONDecodeError:
+                print("Error: Connection file is corrupted")
+                break
+            except IOError as e:
+                print(f"Error reading connection file: {e}")
                 break
                 
         self.connections = {}
@@ -104,16 +112,16 @@ class SSMPortForwarder:
     def save_connections(self):
         """Save connections to encrypted file"""
         try:
-            # Si es la primera vez que se guarda, solicitar confirmación de contraseña
+            # If first time saving, request password confirmation
             if not os.path.exists(self.connections_file):
                 password = getpass.getpass("Create a password to encrypt connections: ")
                 if not password or password.strip() == "":
-                    print("Error: La contraseña no puede estar vacía")
+                    print("Error: Password cannot be empty")
                     return
                     
                 confirm_password = getpass.getpass("Confirm password: ")
                 if password != confirm_password:
-                    print("Error: Las contraseñas no coinciden")
+                    print("Error: Passwords do not match")
                     return
                 
                 key = self.get_encryption_key(password)
@@ -128,8 +136,13 @@ class SSMPortForwarder:
                 f.write(encrypted_data)
                 
             print(f"Saved {len(self.connections)} connections")
+        except ValueError as e:
+            print(f"Error: {str(e)}")
+        except IOError as e:
+            print(f"Error saving connections file: {e}")
         except Exception as e:
-            print(f"Error saving connections: {e}")
+            print(f"Error saving connections: {str(e)}")
+            print(f"Exception type: {type(e).__name__}")
             
     def get_aws_profiles(self):
         """Get available AWS profiles"""
@@ -166,16 +179,13 @@ class SSMPortForwarder:
         
     def check_sso_login(self, profile):
         """Check if SSO login is needed and perform login if necessary"""
-        # Validar que el perfil solo contiene caracteres permitidos
-        import re
-        import webbrowser
-        
+        # Validate that profile only contains allowed characters
         if not re.match(r'^[a-zA-Z0-9_-]+$', profile):
             print(f"ERROR: Invalid profile name: {profile}")
             return False
             
         try:
-            # Usar lista de argumentos en lugar de shell=True
+            # Use argument list instead of shell=True
             cmd = ["aws", "sts", "get-caller-identity", "--profile", profile]
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return True
@@ -187,12 +197,12 @@ class SSMPortForwarder:
             print("\nAfter successful login, run this script again.")
             print("=" * 70 + "\n")
             
-            # Opcionalmente, preguntar si desea abrir un navegador para SSO
+            # Optionally, ask if user wants to open browser for SSO
             try:
                 response = input("Would you like to open the AWS SSO login page now? (y/n): ")
                 if response.lower() == 'y':
                     print("Opening AWS SSO login page...")
-                    # Usar webbrowser para abrir la página de login (más seguro que ejecutar comandos)
+                    # Use webbrowser to open login page (safer than executing commands)
                     webbrowser.open("https://signin.aws.amazon.com/signin")
             except Exception as e:
                 print(f"Error opening browser: {e}")
@@ -261,20 +271,28 @@ class SSMPortForwarder:
             print(f"Failed to authenticate with profile '{profile}'")
             return
             
-        # Start port forwarding session
-        cmd = (
-            f"aws ssm start-session "
-            f"--profile {profile} "
-            f"--target {instance_id} "
-            f"--document-name AWS-StartPortForwardingSessionToRemoteHost "
-            f"--parameters '{{\"host\":[\"{remote_host}\"],\"portNumber\":[\"{remote_port}\"],\"localPortNumber\":[\"{local_port}\"]}}'")
-            
-        print(f"Starting port forwarding session...")
-        print(f"Local port {local_port} → Instance {instance_id} → Remote {remote_host}:{remote_port}")
-        print("\nPress Ctrl+C to stop the session\n")
-        
+        # Start port forwarding session using argument list instead of shell=True
         try:
-            subprocess.run(cmd, shell=True, check=True)
+            # Prepare parameters as a JSON string
+            parameters = json.dumps({
+                "host": [remote_host],
+                "portNumber": [remote_port],
+                "localPortNumber": [local_port]
+            })
+            
+            cmd = [
+                "aws", "ssm", "start-session",
+                "--profile", profile,
+                "--target", instance_id,
+                "--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
+                "--parameters", parameters
+            ]
+            
+            print(f"Starting port forwarding session...")
+            print(f"Local port {local_port} → Instance {instance_id} → Remote {remote_host}:{remote_port}")
+            print("\nPress Ctrl+C to stop the session\n")
+            
+            subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
             print(f"Error starting port forwarding session: {e}")
         except KeyboardInterrupt:
@@ -289,10 +307,15 @@ class SSMPortForwarder:
             print("No AWS profiles found. Please configure AWS CLI first.")
             return None
             
-        # Ask for connection name
+        # Ask for connection name and validate
         name = input("Enter a name for this connection: ")
         if not name:
-            print("Connection name cannot be empty")
+            print("Error: Connection name cannot be empty")
+            return None
+            
+        # Validate connection name (allow only alphanumeric, underscore, hyphen)
+        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+            print("Error: Connection name can only contain letters, numbers, underscores and hyphens")
             return None
             
         if name in self.connections:
@@ -305,9 +328,13 @@ class SSMPortForwarder:
         for i, profile in enumerate(profiles):
             print(f"{i+1}. {profile}")
             
-        profile_idx = int(input("\nSelect profile (number): ")) - 1
-        if profile_idx < 0 or profile_idx >= len(profiles):
-            print("Invalid profile selection")
+        try:
+            profile_idx = int(input("\nSelect profile (number): ")) - 1
+            if profile_idx < 0 or profile_idx >= len(profiles):
+                print("Error: Invalid profile selection")
+                return None
+        except ValueError:
+            print("Error: Please enter a valid number")
             return None
             
         profile = profiles[profile_idx]
@@ -330,9 +357,13 @@ class SSMPortForwarder:
         for i, instance in enumerate(instances):
             print(f"{i+1}. {instance['name']} ({instance['id']}) - {instance['ip']}")
             
-        instance_idx = int(input("\nSelect instance (number): ")) - 1
-        if instance_idx < 0 or instance_idx >= len(instances):
-            print("Invalid instance selection")
+        try:
+            instance_idx = int(input("\nSelect instance (number): ")) - 1
+            if instance_idx < 0 or instance_idx >= len(instances):
+                print("Error: Invalid instance selection")
+                return None
+        except ValueError:
+            print("Error: Please enter a valid number")
             return None
             
         instance = instances[instance_idx]
@@ -340,17 +371,22 @@ class SSMPortForwarder:
         # Ask for remote host and ports
         remote_host = input("\nEnter remote host (IP or hostname): ")
         if not remote_host:
-            print("Remote host cannot be empty")
+            print("Error: Remote host cannot be empty")
+            return None
+            
+        # Validate remote host (IP or hostname)
+        if not re.match(r'^[a-zA-Z0-9.-]+$', remote_host):
+            print("Error: Invalid remote host format")
             return None
             
         remote_port = input("Enter remote port: ")
-        if not remote_port.isdigit():
-            print("Remote port must be a number")
+        if not remote_port.isdigit() or int(remote_port) < 1 or int(remote_port) > 65535:
+            print("Error: Remote port must be a number between 1 and 65535")
             return None
             
         local_port = input("Enter local port: ")
-        if not local_port.isdigit():
-            print("Local port must be a number")
+        if not local_port.isdigit() or int(local_port) < 1 or int(local_port) > 65535:
+            print("Error: Local port must be a number between 1 and 65535")
             return None
             
         # Create connection object
@@ -395,7 +431,16 @@ class SSMPortForwarder:
         
     def delete_connection(self, name):
         """Delete a saved connection"""
+        if not name:
+            print("Error: Connection name cannot be empty")
+            return
+            
         if name in self.connections:
+            confirm = input(f"Are you sure you want to delete connection '{name}'? (y/n): ")
+            if confirm.lower() != 'y':
+                print("Deletion cancelled")
+                return
+                
             del self.connections[name]
             self.save_connections()
             print(f"Connection '{name}' deleted.")
@@ -405,10 +450,10 @@ class SSMPortForwarder:
     def change_password(self):
         """Change the password used to encrypt connections"""
         if not os.path.exists(self.connections_file):
-            print("No hay conexiones guardadas. Crea una conexión primero.")
+            print("Error: No saved connections found. Create a connection first.")
             return
             
-        # Cargar conexiones con la contraseña actual
+        # Load connections with current password
         try:
             old_key = self.get_encryption_key()
             fernet_old = Fernet(old_key)
@@ -419,18 +464,18 @@ class SSMPortForwarder:
             decrypted_data = fernet_old.decrypt(encrypted_data)
             connections_data = decrypted_data.decode()
             
-            # Solicitar y validar nueva contraseña
-            new_password = getpass.getpass("Ingresa la nueva contraseña: ")
+            # Request and validate new password
+            new_password = getpass.getpass("Enter new password: ")
             if not new_password or new_password.strip() == "":
-                print("Error: La contraseña no puede estar vacía")
+                print("Error: Password cannot be empty")
                 return
                 
-            confirm_password = getpass.getpass("Confirma la nueva contraseña: ")
+            confirm_password = getpass.getpass("Confirm new password: ")
             if new_password != confirm_password:
-                print("Error: Las contraseñas no coinciden")
+                print("Error: Passwords do not match")
                 return
                 
-            # Generar nuevo salt y clave
+            # Generate new salt and key
             new_salt = os.urandom(16)
             with open(self.key_file, 'wb') as f:
                 f.write(new_salt)
@@ -444,18 +489,22 @@ class SSMPortForwarder:
             new_key = base64.urlsafe_b64encode(kdf.derive(new_password.encode()))
             fernet_new = Fernet(new_key)
             
-            # Re-encriptar con la nueva clave
+            # Re-encrypt with new key
             new_encrypted_data = fernet_new.encrypt(connections_data.encode())
             
             with open(self.connections_file, 'wb') as f:
                 f.write(new_encrypted_data)
                 
-            print("Contraseña cambiada exitosamente")
+            print("Password changed successfully")
             
-        except (InvalidToken, ValueError) as e:
-            print("Error: Contraseña incorrecta. No se pudo cambiar la contraseña.")
+        except InvalidToken:
+            print("Error: Incorrect password. Password change failed.")
+        except ValueError as e:
+            print(f"Error: {str(e)}")
         except Exception as e:
-            print(f"Error al cambiar la contraseña: {e}")
+            print(f"Error changing password: {str(e)}")
+            # Log the exception type for debugging
+            print(f"Exception type: {type(e).__name__}")
             
     def main(self):
         """Main function to run the tool"""
