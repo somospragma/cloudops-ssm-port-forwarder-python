@@ -1,0 +1,4 @@
+boto3>=1.20.0
+inquirer>=2.7.0
+tabulate>=0.8.9
+cryptography>=36.0.0
